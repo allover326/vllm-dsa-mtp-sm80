@@ -1,0 +1,639 @@
+diff --git a/vllm/model_executor/models/deepseek_mtp.py b/vllm/model_executor/models/deepseek_mtp.py
+index 35cfce3cb98d..c1573adbd33b 100644
+--- a/vllm/model_executor/models/deepseek_mtp.py
++++ b/vllm/model_executor/models/deepseek_mtp.py
+@@ -37,9 +37,11 @@
+     DeepseekV2MoE,
+     _try_load_fp8_indexer_wk,
+ )
++from .interfaces import SupportsPP
+ from .utils import (
+     get_pp_missing_layer_names,
+     get_spec_layer_idx_from_weight_name,
++    make_empty_intermediate_tensors_factory,
+     maybe_prefix,
+ )
+ 
+@@ -227,7 +229,7 @@ def compute_logits(
+ 
+ 
+ @support_torch_compile
+-class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
++class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+         self.config = vllm_config.model_config.hf_config
+@@ -237,6 +239,12 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         )
+         # Set MoE hyperparameters
+         self.set_moe_parameters()
++        # PP support: the MTP draft runs only on the last PP stage (the runner gates
++        # drafter construction on get_pp_group().is_last_rank), so it never actually
++        # consumes PP intermediate tensors — but SupportsPP requires this factory.
++        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
++            ["hidden_states", "residual"], self.config.hidden_size
++        )
+ 
+     def set_moe_parameters(self):
+         self.num_moe_layers = self.config.num_nextn_predict_layers
+@@ -321,6 +329,24 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         for name, loaded_weight in weights:
+             if "rotary_emb.inv_freq" in name:
+                 continue
++            # Load the draft's own embed_tokens. The MTP module embeds the
++            # tokens it drafts via its own embed_tokens, but the checkpoint
++            # stores embed_tokens as a single top-level (shared/tied) weight
++            # whose spec_layer is None -- so the loop below skips it. Under
++            # pipeline parallelism the target model's embed_tokens is a
++            # PPMissingLayer on the draft's last stage, so the draft cannot
++            # borrow it and MUST load its own copy here, or it embeds tokens
++            # with uninitialized weights and produces garbage drafts.
++            if "embed_tokens" in name:
++                param = params_dict.get(name)
++                if param is not None:
++                    weight_loader = getattr(param, "weight_loader", None)
++                    if weight_loader is not None:
++                        weight_loader(param, loaded_weight)
++                    else:
++                        param.data.copy_(loaded_weight)
++                    loaded_params.add(name)
++                continue
+             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+             if spec_layer is None:
+                 continue
+diff --git a/vllm/model_executor/models/qwen3_5_mtp.py b/vllm/model_executor/models/qwen3_5_mtp.py
+index 6421c8b60d2d..f4c5e2011112 100644
+--- a/vllm/model_executor/models/qwen3_5_mtp.py
++++ b/vllm/model_executor/models/qwen3_5_mtp.py
+@@ -36,6 +36,7 @@
+ from .interfaces import (
+     MultiModalEmbeddings,
+     SupportsMultiModal,
++    SupportsPP,
+     _require_is_multimodal,
+ )
+ from .utils import (
+@@ -145,7 +146,8 @@ def forward(
+         inputs_embeds: torch.Tensor | None = None,
+         spec_step_idx: int = 0,
+     ) -> torch.Tensor:
+-        if get_pp_group().is_first_rank:
++        pp_group = get_pp_group()
++        if pp_group.is_first_rank:
+             if inputs_embeds is None:
+                 inputs_embeds = self.embed_input_ids(input_ids)
+             assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
+@@ -154,7 +156,18 @@ def forward(
+             hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
+             hidden_states = self.fc(hidden_states)
+             residual = None
++        elif pp_group.is_last_rank:
++            # Last PP rank: apply the same fc projection as first rank,
++            # using the target model's output on this rank.
++            if inputs_embeds is None:
++                inputs_embeds = self.embed_input_ids(input_ids)
++            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
++            hidden_states = self.pre_fc_norm_hidden(hidden_states)
++            hidden_states = torch.cat([inputs_embeds, hidden_states], dim=-1)
++            hidden_states = self.fc(hidden_states)
++            residual = None
+         else:
++            # Middle PP rank: use intermediate tensors from previous rank.
+             assert intermediate_tensors is not None
+             hidden_states = intermediate_tensors["hidden_states"]
+             residual = intermediate_tensors["residual"]
+@@ -209,7 +222,7 @@ def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         "hidden_states": 0,
+     }
+ )
+-class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal):
++class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
+     packed_modules_mapping = {
+         "qkv_proj": [
+             "q_proj",
+@@ -252,6 +265,10 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+ 
+         self.logits_processor = LogitsProcessor(config.vocab_size)
+ 
++        self.make_empty_intermediate_tensors = (
++            self.model.make_empty_intermediate_tensors
++        )
++
+     def embed_input_ids(
+         self,
+         input_ids: torch.Tensor,
+@@ -287,6 +304,12 @@ def forward(
+         inputs_embeds: torch.Tensor | None = None,
+         **kwargs: object,
+     ):
++        if not get_pp_group().is_first_rank and intermediate_tensors is None:
++            intermediate_tensors = self.make_empty_intermediate_tensors(
++                batch_size=hidden_states.shape[0],
++                dtype=hidden_states.dtype,
++                device=hidden_states.device,
++            )
+         hidden_states = self.model(
+             input_ids, positions, hidden_states, intermediate_tensors, inputs_embeds
+         )
+diff --git a/vllm/models/deepseek_v32/nvidia/model.py b/vllm/models/deepseek_v32/nvidia/model.py
+index 353aedc8ceed..cd3510f86fd8 100644
+--- a/vllm/models/deepseek_v32/nvidia/model.py
++++ b/vllm/models/deepseek_v32/nvidia/model.py
+@@ -194,12 +194,13 @@ def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         # DSA is always sparse (has index_topk); allocate the shared top-k
+         # buffer the indexer writes and the sparse MLA backend reads.
+         self.is_v32 = True
+-        topk_indices_buffer = torch.empty(
++        self.topk_indices_buffer = torch.empty(
+             vllm_config.scheduler_config.max_num_batched_tokens,
+             config.index_topk,
+             dtype=torch.int32,
+             device=self.device,
+         )
++        topk_indices_buffer = self.topk_indices_buffer
+ 
+         if get_pp_group().is_first_rank:
+             self.embed_tokens = VocabParallelEmbedding(
+diff --git a/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py b/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
+index 7c320b1ea35b..af7fbad06200 100644
+--- a/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashattn_mla_sparse.py
+@@ -202,6 +202,10 @@ def __init__(
+             topk_indices_buffer=topk_indices_buffer,
+             **mla_args,
+         )
++        # Keep the indexer, not just the buffer the base class snapshots from it:
++        # under MTP+PP the indexer swaps its buffer between the target and draft
++        # passes, so forward_mqa has to re-read it rather than use the snapshot.
++        self._indexer = indexer
+         assert self.topk_indices_buffer is not None, (
+             "Indexer or topk_indices_buffer required for sparse MLA"
+         )
+@@ -221,8 +225,13 @@ def forward_mqa(
+         q_nope, q_rope = q
+         num_actual_toks = q_rope.shape[0]
+ 
+-        assert self.topk_indices_buffer is not None
+-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
++        buf = (
++            self._indexer.topk_indices_buffer
++            if self._indexer is not None
++            else self.topk_indices_buffer
++        )
++        assert buf is not None, "topk_indices_buffer required for sparse MLA"
++        topk_indices = buf[:num_actual_toks]
+         topk_indices, valid_counts = triton_convert_req_index_to_global_index(
+             attn_metadata.req_id_per_token[:num_actual_toks],
+             attn_metadata.block_table,
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+index a6b9f4abb0d5..807adc16869b 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
+@@ -367,6 +367,10 @@ def __init__(
+             topk_indices_buffer=topk_indices_buffer,
+             **mla_args,
+         )
++        # Keep the indexer, not just the buffer the base class snapshots from it:
++        # under MTP+PP the indexer swaps its buffer between the target and draft
++        # passes, so forward_mqa has to re-read it rather than use the snapshot.
++        self._indexer = indexer
+ 
+         self._workspace_buffer: torch.Tensor | None = None
+         self.bmm1_scale: float | None = None
+@@ -389,8 +393,13 @@ def forward_mqa(
+ 
+         num_actual_toks = q.shape[0]
+ 
+-        assert self.topk_indices_buffer is not None
+-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
++        buf = (
++            self._indexer.topk_indices_buffer
++            if self._indexer is not None
++            else self.topk_indices_buffer
++        )
++        assert buf is not None, "topk_indices_buffer required for sparse MLA"
++        topk_indices = buf[:num_actual_toks]
+ 
+         if self.dcp_world_size > 1:
+             topk_indices_physical, seq_lens = triton_filter_and_convert_dcp_index(
+diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+index 9db696a39c43..f1b1656ce656 100644
+--- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
++++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
+@@ -83,6 +83,7 @@ def __init__(
+             )
+         self.kv_scale_format = _kv_scale_format_for_model(model_type)
+ 
++        self._indexer = indexer
+         # Skip-topk layers are built with indexer=None and get the shared
+         # buffer via mla_args instead (cf. FLASHMLA_SPARSE).
+         self.topk_indices_buffer: torch.Tensor | None = (
+@@ -114,8 +115,13 @@ def forward_mqa(
+ 
+         num_actual_toks = q.shape[0]
+ 
+-        assert self.topk_indices_buffer is not None
+-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
++        buf = (
++            self._indexer.topk_indices_buffer
++            if self._indexer is not None
++            else self.topk_indices_buffer
++        )
++        assert buf is not None, "topk_indices_buffer required for sparse MLA"
++        topk_indices = buf[:num_actual_toks]
+ 
+         topk_indices_physical = cast(
+             torch.Tensor,
+diff --git a/vllm/v1/attention/backends/mla/flashmla_sparse.py b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+index e8be7ad5bb39..a28b0fa284cc 100644
+--- a/vllm/v1/attention/backends/mla/flashmla_sparse.py
++++ b/vllm/v1/attention/backends/mla/flashmla_sparse.py
+@@ -550,6 +550,10 @@ def __init__(
+             topk_indices_buffer=topk_indices_buffer,
+             **mla_args,
+         )
++        # Keep the indexer, not just the buffer the base class snapshots from it:
++        # under MTP+PP the indexer swaps its buffer between the target and draft
++        # passes, so forward_mqa has to re-read it rather than use the snapshot.
++        self._indexer = indexer
+         self.softmax_scale = scale
+         # Prefill BF16 kernel requires 64 on Hopper, 128 on Blackwell
+         self.prefill_padding = (
+@@ -854,8 +858,13 @@ def forward_mqa(
+         num_actual_toks = q.shape[0]
+ 
+         # Get topk indices
+-        assert self.topk_indices_buffer is not None
+-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
++        buf = (
++            self._indexer.topk_indices_buffer
++            if self._indexer is not None
++            else self.topk_indices_buffer
++        )
++        assert buf is not None, "topk_indices_buffer required for sparse MLA"
++        topk_indices = buf[:num_actual_toks]
+ 
+         use_fp8_cache = self.kv_cache_dtype == "fp8_ds_mla"
+ 
+diff --git a/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py b/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
+index d5db42cb7f96..2242f6643791 100644
+--- a/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py
+@@ -693,6 +693,7 @@ def __init__(
+         self.kv_cache_dtype = kv_cache_dtype
+         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
+         self.softmax_scale = scale
++        self._indexer = indexer
+         # The indexer carries the shared buffer for normal layers and tests;
+         # the explicitly-passed buffer covers backbone skip layers, whose
+         # indexer is not constructed (see deepseek_v2.py).
+@@ -778,8 +779,13 @@ def forward_mqa(
+         num_actual_toks = attn_metadata.num_actual_tokens
+ 
+         # Get topk indices
+-        assert self.topk_indices_buffer is not None
+-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
++        buf = (
++            self._indexer.topk_indices_buffer
++            if self._indexer is not None
++            else self.topk_indices_buffer
++        )
++        assert buf is not None, "topk_indices_buffer required for sparse MLA"
++        topk_indices = buf[:num_actual_toks]
+ 
+         triton_convert_req_index_to_global_index(
+             attn_metadata.req_id_per_token,
+diff --git a/vllm/v1/attention/backends/mla/xpu_mla_sparse.py b/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+index d24147bfc3b5..f3ea660e4008 100644
+--- a/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
++++ b/vllm/v1/attention/backends/mla/xpu_mla_sparse.py
+@@ -197,6 +197,7 @@ def __init__(
+         self.kv_cache_dtype = kv_cache_dtype
+         self.kv_lora_rank: int = mla_args["kv_lora_rank"]
+         self.softmax_scale = scale
++        self._indexer = indexer
+         # The indexer carries the shared buffer for normal layers and tests;
+         # the explicitly-passed buffer covers backbone skip layers, whose
+         # indexer is not constructed (see deepseek_v2.py).
+@@ -246,8 +247,13 @@ def forward_mqa(
+ 
+         num_actual_toks = q.shape[0]
+ 
+-        assert self.topk_indices_buffer is not None
+-        topk_indices = self.topk_indices_buffer[:num_actual_toks]
++        buf = (
++            self._indexer.topk_indices_buffer
++            if self._indexer is not None
++            else self.topk_indices_buffer
++        )
++        assert buf is not None, "topk_indices_buffer required for sparse MLA"
++        topk_indices = buf[:num_actual_toks]
+ 
+         topk_indices_global = triton_convert_req_index_to_global_index(
+             attn_metadata.req_id_per_token,
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 9182ada43946..caef524f1ca5 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -815,7 +815,18 @@ def update_pp_decode_requests(self):
+         if self.pp_handler is not None:
+             outputs = self.pp_handler.get_prev_sampled_outputs()
+             if outputs is not None:
++                # Spec decode: scatter the relayed proposed draft tokens into this
++                # rank's state so the next step's combine_sampled_and_draft_tokens
++                # reads real values. Pop before postprocess_sampled (which does not
++                # accept this kwarg). idx_mapping has -1 for excluded/freed reqs.
++                draft_tokens = outputs.pop("draft_tokens", None)
++                idx_mapping = outputs["idx_mapping"]
+                 self.postprocess_sampled(**outputs)
++                if draft_tokens is not None:
++                    valid = idx_mapping >= 0
++                    self.req_states.draft_tokens[idx_mapping[valid]] = draft_tokens[
++                        valid
++                    ]
+ 
+     def add_requests(self, scheduler_output: SchedulerOutput) -> None:
+         for new_req_data in scheduler_output.scheduled_new_reqs:
+@@ -1535,20 +1546,26 @@ def sample_tokens(
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
+             draft_tokens = self.speculator.propose(
+-                input_batch,
+-                attn_metadata,
+-                slot_mappings_by_layer,
+-                spec_hidden_states,
+-                aux_hidden_states,
+-                num_sampled,
+-                num_rejected,
+-                self.req_states.last_sampled_tokens,
+-                self.req_states.next_prefill_tokens,
+-                self.sampler.sampling_states.temperature.gpu,
+-                self.sampler.sampling_states.seeds.gpu,
++                input_batch=input_batch,
++                attn_metadata=attn_metadata,
++                slot_mappings=slot_mappings_by_layer,
++                last_hidden_states=spec_hidden_states,
++                aux_hidden_states=aux_hidden_states,
++                num_sampled=num_sampled,
++                num_rejected=num_rejected,
++                last_sampled=self.req_states.last_sampled_tokens,
++                next_prefill_tokens=self.req_states.next_prefill_tokens,
++                temperature=self.sampler.sampling_states.temperature.gpu,
++                seeds=self.sampler.sampling_states.seeds.gpu,
+                 mm_inputs=mm_inputs,
++                intermediate_tensors=self.intermediate_tensors,
+             )
+             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
++            if self.pp_handler is not None:
++                # Relay the proposed draft tokens to non-last PP ranks so their
++                # next-step combine_sampled_and_draft_tokens reads real values
++                # instead of zero-init (otherwise spec acceptance ~= 0 / garbage).
++                self.pp_handler.broadcast_draft(draft_tokens, input_batch)
+ 
+         if self.num_speculative_steps > 0:
+             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+diff --git a/vllm/v1/worker/gpu/pp_utils.py b/vllm/v1/worker/gpu/pp_utils.py
+index 9b1786cbe4cf..38b45e45f1e6 100644
+--- a/vllm/v1/worker/gpu/pp_utils.py
++++ b/vllm/v1/worker/gpu/pp_utils.py
+@@ -30,6 +30,10 @@ class PendingRecv:
+     # Snapshot of slot generation counters at receive time, used to
+     # detect requests aborted since then.
+     gen_at_receive_np: np.ndarray  # [num_reqs]
++    # Spec decode: proposed draft tokens relayed from the last rank, scattered
++    # into the non-last rank's req_states.draft_tokens on consume. None when spec
++    # is off (max_sample_len == 1).
++    draft_tokens: torch.Tensor | None = None  # [num_reqs, max_sample_len - 1]
+ 
+ 
+ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
+@@ -121,6 +125,7 @@ def get_prev_sampled_outputs(self) -> dict[str, torch.Tensor] | None:
+             num_sampled=slot.num_sampled,
+             num_rejected=slot.num_rejected,
+             idx_mapping=idx_mapping,
++            draft_tokens=slot.draft_tokens,
+         )
+ 
+     def receive(self, input_batch: InputBatch) -> bool:
+@@ -149,12 +154,28 @@ def receive(self, input_batch: InputBatch) -> bool:
+             torch.distributed.broadcast(
+                 combined, src=self.last_rank, group=self.broadcast_group
+             )
++            # Spec decode: 3rd broadcast on this group — the proposed draft tokens
++            # relayed by the last rank (matches broadcast_draft's order). NCCL
++            # matches by op order on the communicator; the deferred event covers it.
++            draft_tokens = None
++            if self.max_sample_len > 1:
++                draft_tokens = torch.empty(
++                    num_reqs,
++                    self.max_sample_len - 1,
++                    dtype=torch.int64,
++                    device=self.device,
++                )
++                torch.distributed.broadcast(
++                    draft_tokens, src=self.last_rank, group=self.broadcast_group
++                )
+             event = self.broadcast_stream.record_event()
+             num_sampled, num_rejected = combined.unbind(dim=0)
+             # Must record_stream since these were allocated on broadcast stream but
+             # later used on the main stream.
+             sampled_tokens.record_stream(self.main_stream)
+             combined.record_stream(self.main_stream)
++            if draft_tokens is not None:
++                draft_tokens.record_stream(self.main_stream)
+         self.queue[-1] = PendingRecv(
+             event,
+             sampled_tokens,
+@@ -164,6 +185,7 @@ def receive(self, input_batch: InputBatch) -> bool:
+             input_batch.idx_mapping_np,
+             need_sampled_mask,
+             gen_at_receive_np,
++            draft_tokens,
+         )
+         return bool(need_sampled_mask.all())
+ 
+@@ -180,6 +202,22 @@ def broadcast(
+             return
+ 
+         assert sampled_token_ids.dtype == torch.int64
++        # The receiver always posts a [num_reqs, max_sample_len] buffer, but under
++        # spec decode the sampler emits width 1 on any step with no draft tokens
++        # (prefill, first decode) and width (num_spec+1) only once rejection
++        # sampling has run. Pad to max_sample_len so the NCCL broadcast element
++        # count matches the receiver on EVERY step (an unpadded width-1 send vs a
++        # width-(num_spec+1) recv is a count mismatch that deadlocks the receiver).
++        # Trailing -1 columns are placeholders ignored by post_update, which
++        # advances each request by its per-request num_sampled valid count.
++        width = sampled_token_ids.shape[-1]
++        if width != self.max_sample_len:
++            assert width < self.max_sample_len
++            padded = sampled_token_ids.new_full(
++                (sampled_token_ids.shape[0], self.max_sample_len), -1
++            )
++            padded[:, :width] = sampled_token_ids
++            sampled_token_ids = padded
+ 
+         if current_platform.is_xpu():
+             self.main_stream.synchronize()
+@@ -197,3 +235,28 @@ def broadcast(
+             )
+             for tensor in (sampled_token_ids, num_sampled, num_rejected):
+                 tensor.record_stream(self.broadcast_stream)
++
++    def broadcast_draft(
++        self, draft_tokens: torch.Tensor, input_batch: InputBatch
++    ) -> None:
++        """Relay the proposed draft tokens (spec decode) from the last rank to the
++        non-last ranks. Issued AFTER propose(), so it is the 3rd broadcast on this
++        group for the step (sampled, combined, draft) — matching the order in which
++        `receive` posts its recvs. Gated identically to `broadcast` so op counts
++        stay matched across ranks. Without this, non-last ranks verify against a
++        zero-init req_states.draft_tokens (near-zero acceptance, corrupt output)."""
++        assert self.is_last_rank
++        if self.max_sample_len <= 1:
++            return
++        if compute_need_sampled_mask(input_batch) is None:
++            # No request needs sampled outputs next step; `broadcast` skipped too,
++            # so skip here to keep the per-step broadcast count matched.
++            return
++        draft_tokens = draft_tokens.to(torch.int64).contiguous()
++        with torch.cuda.stream(self.broadcast_stream):
++            # wait_stream so the side-stream broadcast sees propose()'s output.
++            self.broadcast_stream.wait_stream(self.main_stream)
++            torch.distributed.broadcast(
++                draft_tokens, src=self.last_rank, group=self.broadcast_group
++            )
++            draft_tokens.record_stream(self.broadcast_stream)
+diff --git a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+index 9035ea38b233..dd2fdf1840a0 100644
+--- a/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py
+@@ -6,9 +6,11 @@
+ 
+ from vllm.config import VllmConfig
+ from vllm.config.compilation import CUDAGraphMode
++from vllm.distributed.parallel_state import get_pp_group
+ from vllm.forward_context import BatchDescriptor, set_forward_context
+ from vllm.logger import init_logger
+ from vllm.multimodal import MULTIMODAL_REGISTRY
++from vllm.sequence import IntermediateTensors
+ from vllm.triton_utils import tl, triton
+ from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+ from vllm.v1.worker.gpu.cudagraph_utils import (
+@@ -152,6 +154,7 @@ def propose(
+         skip_attn_for_dummy_run: bool = False,
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+         is_profile: bool = False,
++        intermediate_tensors: IntermediateTensors | None = None,
+     ) -> torch.Tensor:
+         num_tokens = input_batch.num_tokens_after_padding
+         num_reqs = input_batch.num_reqs
+@@ -233,6 +236,7 @@ def propose(
+                 num_tokens_across_dp=num_tokens_across_dp,
+                 cudagraph_runtime_mode=prefill_batch_desc.cg_mode,
+                 mm_inputs=mm_inputs,
++                intermediate_tensors=intermediate_tensors,
+             )
+ 
+         if self.num_speculative_steps == 1:
+@@ -269,6 +273,7 @@ def propose(
+             decode_batch_desc,
+             num_tokens_across_dp,
+             input_batch.seq_lens_cpu_upper_bound,
++            intermediate_tensors=intermediate_tensors,
+         )
+ 
+         return self.draft_tokens[:num_reqs]
+@@ -282,6 +287,7 @@ def _run_model(
+         num_tokens_across_dp: torch.Tensor | None,
+         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
++        intermediate_tensors: IntermediateTensors | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+         batch_descriptor = BatchDescriptor(num_tokens=num_tokens)
+         with set_forward_context(
+@@ -313,6 +319,16 @@ def _run_model(
+                 hidden_states=self.hidden_states[:num_tokens],
+                 inputs_embeds=inputs_embeds,
+             )
++            # Only consult the PP group when there are PP intermediate
++            # tensors to consume: at PP=1 (and in unit tests) no PP group is
++            # initialized and none is needed.
++            if intermediate_tensors is not None and not get_pp_group().is_first_rank:
++                n = num_tokens
++                new_tensors = {
++                    k: v[:n].copy_(intermediate_tensors.tensors[k][:n])
++                    for k, v in intermediate_tensors.tensors.items()
++                }
++                model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+             if cudagraph_runtime_mode == CUDAGraphMode.PIECEWISE:
+                 # Draft prefill with PIECEWISE cudagraph (compiled PW or breakable),
+                 # chosen inside run_pw_graph.
+@@ -341,6 +357,7 @@ def _prefill(
+         num_tokens_across_dp: torch.Tensor | None,
+         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
++        intermediate_tensors: IntermediateTensors | None = None,
+     ) -> None:
+         last_token_indices = self.last_token_indices[:num_reqs]
+         positions = self.input_buffers.positions[last_token_indices]
+@@ -353,6 +370,7 @@ def _prefill(
+             num_tokens_across_dp=num_tokens_across_dp,
+             cudagraph_runtime_mode=cudagraph_runtime_mode,
+             mm_inputs=mm_inputs,
++            intermediate_tensors=intermediate_tensors,
+         )
+         sample_hidden_states = last_hidden_states[last_token_indices]
+ 
+@@ -378,6 +396,7 @@ def _multi_step_decode(
+         batch_desc: BatchExecutionDescriptor,
+         num_tokens_across_dp: torch.Tensor | None,
+         seq_lens_cpu_upper_bound: torch.Tensor,
++        intermediate_tensors: IntermediateTensors | None = None,
+     ) -> None:
+         positions = self.input_buffers.positions[:num_reqs]
+         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
+@@ -421,6 +440,7 @@ def _multi_step_decode(
+                     slot_mappings_by_layer,
+                     num_tokens_across_dp=num_tokens_across_dp,
+                     cudagraph_runtime_mode=batch_desc.cg_mode,
++                    intermediate_tensors=intermediate_tensors,
+                 )
+ 
+     def _generate_draft(
+@@ -431,6 +451,7 @@ def _generate_draft(
+         slot_mappings: dict[str, torch.Tensor] | None,
+         num_tokens_across_dp: torch.Tensor | None,
+         cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
++        intermediate_tensors: IntermediateTensors | None = None,
+     ) -> None:
+         self._prepare_eplb_forward(num_reqs)
+ 
+@@ -443,6 +464,7 @@ def _generate_draft(
+             slot_mappings,
+             num_tokens_across_dp,
+             cudagraph_runtime_mode,
++            intermediate_tensors=intermediate_tensors,
+         )
+         last_hidden_states = last_hidden_states[:num_reqs]
+ 
+diff --git a/vllm/v1/worker/gpu/spec_decode/speculator.py b/vllm/v1/worker/gpu/spec_decode/speculator.py
+index 08ba7dcd5b94..066ffb7a2878 100644
+--- a/vllm/v1/worker/gpu/spec_decode/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/speculator.py
+@@ -12,6 +12,7 @@
+ from vllm.distributed.eplb.eplb_state import EplbState
+ from vllm.logger import init_logger
+ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
++from vllm.sequence import IntermediateTensors
+ from vllm.v1.kv_cache_interface import KVCacheConfig
+ from vllm.v1.worker.gpu.attn_utils import (
+     build_attn_metadata,
+@@ -62,6 +63,7 @@ def propose(
+         skip_attn_for_dummy_run: bool = False,
+         mm_inputs: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+         is_profile: bool = False,
++        intermediate_tensors: IntermediateTensors | None = None,
+     ) -> torch.Tensor:
+         pass
+ 
