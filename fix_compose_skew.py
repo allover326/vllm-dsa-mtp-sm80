@@ -14,11 +14,15 @@ SP = os.environ.get("VLLM_TREE", "/usr/local/lib/python3.12/dist-packages/vllm")
 
 
 def sub(path, old, new, tag):
+    # newline="" disables platform newline translation so running this on
+    # Windows (e.g. against a source checkout) cannot rewrite LF as CRLF.
     p = f"{SP}/{path}"
-    s = open(p).read()
+    with open(p, encoding="utf-8", newline="") as f:
+        s = f.read()
     n = s.count(old)
     assert n == 1, f"{tag}: pattern count={n} in {path}"
-    open(p, "w").write(s.replace(old, new))
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(s.replace(old, new))
     print(f"OK {tag}")
 
 
