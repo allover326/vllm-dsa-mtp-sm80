@@ -22,7 +22,7 @@ because neither is merged yet and they target different eras of `main`.
 ## Quick start
 
 ```bash
-git clone https://github.com/cachenetics/vllm-dsa-mtp-sm80
+git clone https://github.com/allover326/vllm-dsa-mtp-sm80
 cd vllm-dsa-mtp-sm80
 ./build_compose.sh            # → image vllm-mtp:compose46994-38476  (~2 min)
 ```
@@ -91,7 +91,7 @@ documents all 15, each asserting its exact target):
    patched tree against stock).
 
 A source-tree fork with everything applied is also available:
-[cachenetics/vllm @ `compose-46994-38476-v0.26.0`](https://github.com/cachenetics/vllm/tree/compose-46994-38476-v0.26.0).
+[allover326/vllm @ `compose-46994-38476-v0.26.0`](https://github.com/allover326/vllm/tree/compose-46994-38476-v0.26.0).
 
 ## Files
 
