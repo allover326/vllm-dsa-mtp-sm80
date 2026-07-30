@@ -276,4 +276,32 @@ sub("model_executor/layers/attention/mla_attention.py",
             and attn_metadata.prefill.chunked_context is None""",
 "mla-prefill-getattr")
 
+# ---- indexer.py: allow KV page-size padding for the DSA indexer cache ----
+# 0.26.0's page unifier pads non-divisible pages only when the backend opts in.
+# The indexer page (block*132B) never divides the sparse-MLA page (96:11 byte
+# ratio), so GLM/DSA models cannot boot without this. Safe because all three
+# ops touching this cache (indexer_k_quant_and_cache, cp_gather_indexer_k_
+# quant_cache, fp8_paged_mqa_logits_triton) address blocks via an explicit
+# kv_cache.stride(0). Discovered on real GLM-5.2 (tiny models with
+# max_model_len <= index_topk never build this cache).
+sub("v1/attention/backends/mla/indexer.py",
+"""class DeepseekV32IndexerBackend(AttentionBackend):
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+""",
+"""class DeepseekV32IndexerBackend(AttentionBackend):
+    @classmethod
+    def indexes_kv_by_block_stride(cls) -> bool:
+        # sm_80 compose: allow page-size padding for this cache. All three ops
+        # that touch it (indexer_k_quant_and_cache, cp_gather_indexer_k_quant
+        # _cache, fp8_paged_mqa_logits_triton) address blocks via an explicit
+        # kv_cache.stride(0), so a padded (non-contiguous) block dim is safe.
+        return True
+
+    @classmethod
+    def supports_pcp(cls) -> bool:
+        return True
+""", "indexer-page-pad-optin")
+
 print("ALL_FIXES_APPLIED")

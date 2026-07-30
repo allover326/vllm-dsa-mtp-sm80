@@ -14,7 +14,7 @@ compilation.
 |---|---|---|
 | [PR #38476](https://github.com/vllm-project/vllm/pull/38476) | `TRITON_MLA_SPARSE` — pure-Triton sparse-MLA backend for SM8x/11x/12x | open |
 | [PR #46994](https://github.com/vllm-project/vllm/pull/46994) | MTP speculative decoding under pipeline parallelism (V2 model runner) | open |
-| this repo | 15 skew fixes composing both onto v0.26.0 (`fix_compose_skew.py`) | — |
+| this repo | 16 skew fixes composing both onto v0.26.0 (`fix_compose_skew.py`) | — |
 
 All credit for the heavy lifting goes to the authors of those two PRs. This repo exists
 because neither is merged yet and they target different eras of `main`.
@@ -38,24 +38,50 @@ docker run --rm --runtime=nvidia --shm-size=32g \
   vllm-mtp:compose46994-38476 \
   --model /models/GLM-5.2-Int4-Int8Mix \
   --pipeline-parallel-size 8 --tensor-parallel-size 1 \
-  --max-model-len 32768 --gpu-memory-utilization 0.90 \
+  --max-model-len 16384 --gpu-memory-utilization 0.80 \
+  --block-size 64 --enforce-eager \
   --kv-cache-dtype auto --trust-remote-code \
   --speculative-config '{"method":"mtp","num_speculative_tokens":1}'
+# --block-size 64 is REQUIRED (kernel block negotiation fails at the default).
+# Without MTP: 32768 / 0.90 and drop --enforce-eager (28.47 tok/s measured PP8).
+# With MTP: eager + 0.80 -- the draft loads extra weight on the last PP rank
+# and cudagraph capture OOM'd at 0.90 on 8x64GB.
 ```
 
 Benchmark baseline-vs-MTP instead with `glm_mtp_bench.py` (see file header).
 
-## Validation status (2026-07-29)
+## Validation status (updated 2026-07-30)
 
+- **GLM-5.2-744B real weights (`QuantTrio/GLM-5.2-Int4-Int8Mix`), 8× CMP 170HX
+  (sm_80, PCIe Gen2 x4), PP8:** ✅ **28.47 tok/s decode, coherent output,
+  cudagraphs on** — within ~6% of the bespoke 0.20.2-era recipe (30.2), now on a
+  stock PyPI wheel. Requires `--block-size 64` and this repo's indexer
+  page-padding fix (see below); both ship here.
+- **GLM-5.2 + MTP:** the DeepSeek-family draft **loads and initializes under
+  PP8** (SupportsPP path exercised on real weights). The first attempt OOM'd on
+  the *last PP rank* — the draft layer + its private embed + LM head concentrate
+  there — during cudagraph capture at `gpu-memory-utilization 0.90`. The bench
+  now runs the MTP config eager at 0.80/16k; a measured speedup number is
+  pending the next session. On MiMo-7B this exact stack measured **1.28× at
+  70.9% acceptance**, and the tiny-GLM plumbing test is greedy-equivalent, so
+  the remaining risk is memory tuning, not correctness.
 - **Tiny random-init `glm_moe_dsa` (incl. MTP nextn layer), 2× RTX 3090:** PP1 ✅,
   PP2 ✅, **PP2 + MTP n=1 ✅ — token-for-token identical to the PP2 baseline
-  (greedy-equivalent)**. Regenerate the test checkpoint with `gen_tiny_glm.py`,
-  run the matrix with `tiny_glm_test.py`.
+  (greedy-equivalent)**. Regenerate with `gen_tiny_glm.py`, run `tiny_glm_test.py`.
+  Note: tiny configs with `max_model_len <= index_topk` never build the indexer
+  KV cache, so they cannot catch the two real-model boot blockers below.
 - **MiMo-7B-RL real weights (PP2, 2× 3090, #46994 alone):** 54.4 → 69.5 tok/s
   (**1.28×**), draft acceptance **70.9%**, no deadlock, cudagraphs on.
-- **GLM-5.2-744B real weights:** in progress — this section will be updated with
-  measured PP8 numbers. Reference: the same 8×170HX rig does 30.2 tok/s decode /
-  2,675 tok/s prefill @131k without MTP (vLLM 0.20.2 + #38476).
+
+### Operational warnings for multi-GPU rigs (learned the expensive way)
+- **Never tree-kill or `kill -9` a crashed multi-GPU vLLM run** (`tmux
+  kill-session`, `pkill`, etc.). Killed workers strand CUDA contexts in the
+  host driver: NVML keeps showing all GPUs while the CUDA runtime drops them
+  (`device < num_gpus INTERNAL ASSERT`, wrong count). A container restart does
+  NOT clear it — only a **host** reboot does. Send SIGINT to the Python PID and
+  wait, or let the process die on its own.
+- Put retries *inside* one process (see `glm_mtp_bench.py`'s attempt ladder)
+  so external kills are never needed.
 
 ## Which GLM-5.2 quants work on sm_80
 
@@ -73,7 +99,16 @@ Also: keep `--kv-cache-dtype auto` (BF16) — FP8 KV needs sm_89+.
 ## The skew fixes (why this repo isn't just `patch < *.diff`)
 
 `v0.26.0` sits between the two PRs' base trees. The big ones (`fix_compose_skew.py`
-documents all 15, each asserting its exact target):
+documents all 16, each asserting its exact target):
+
+0. **`indexer.py`: opt the DSA indexer KV cache into page-size padding.** The
+   indexer page (block×132 B) never divides the sparse-MLA page (96:11 byte
+   ratio — no block size can fix it), so real DSA models cannot boot 0.26.0's
+   KV unifier without padding. Safe: all three ops touching that cache
+   (`indexer_k_quant_and_cache`, `cp_gather_indexer_k_quant_cache`,
+   `fp8_paged_mqa_logits_triton`) address blocks via `kv_cache.stride(0)` —
+   verified in csrc before enabling. Only real models trigger this; tiny
+   test models with `max_model_len <= index_topk` skip the indexer cache.
 
 1. **`deepseek_v2.py`: fused indexer-q rope-quant gated to sm_89+.** 0.26.0
    unconditionally launches a Triton kernel that converts to `fp8e4nv`, which Triton

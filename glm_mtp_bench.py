@@ -23,10 +23,16 @@ def bench(tag, spec):
         kw["speculative_config"] = {"method": "mtp", "num_speculative_tokens": 1}
     try:
         t0 = time.time()
+        # block_size=64 is REQUIRED for real DSA models (kernel block-size
+        # negotiation fails at the engine default of 16). The MTP config runs
+        # eager at lower util: the draft concentrates extra weight on the last
+        # PP rank and graph capture pushed it OOM at 0.90 on 8x64GB (2026-07-30).
         llm = LLM(model=M, tensor_parallel_size=1, pipeline_parallel_size=PP,
-                  max_model_len=32768, gpu_memory_utilization=0.90,
+                  max_model_len=32768 if not spec else 16384,
+                  gpu_memory_utilization=0.90 if not spec else 0.80,
+                  block_size=64,
                   kv_cache_dtype="auto", trust_remote_code=True,
-                  disable_log_stats=False, enforce_eager=False, **kw)
+                  disable_log_stats=False, enforce_eager=bool(spec), **kw)
         load = time.time() - t0
         llm.generate(PROMPTS, SamplingParams(max_tokens=8, temperature=0.0), use_tqdm=False)
         t0 = time.time()
