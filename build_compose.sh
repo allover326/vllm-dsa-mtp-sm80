@@ -54,6 +54,18 @@ importlib.import_module('vllm.v1.attention.ops.mqa_logits_triton')
 importlib.import_module('vllm.model_executor.layers.sparse_attn_indexer')
 print('SMOKE_OK')"
 
+echo "== undefined-name check (would have caught a patch that calls code no patch defines) =="
+docker exec $NAME sh -c '
+  pip install -q pyflakes >/dev/null 2>&1 || { echo "PYFLAKES_UNAVAILABLE (skipping - not a pass)"; exit 0; }
+  cd /usr/local/lib/python3.12/dist-packages || exit 1
+  OUT=$(python3 -m pyflakes     vllm/model_executor/models/deepseek_mtp.py     vllm/model_executor/models/qwen3_5_mtp.py     vllm/model_executor/models/mimo_mtp.py     vllm/model_executor/models/deepseek_v2.py     vllm/model_executor/layers/sparse_attn_indexer.py     vllm/model_executor/layers/attention/mla_attention.py     vllm/platforms/cuda.py     vllm/v1/attention/backends/registry.py     vllm/v1/attention/backends/mla/indexer.py     vllm/v1/attention/backends/mla/triton_mla_sparse.py     vllm/v1/attention/ops/mqa_logits_triton.py     vllm/v1/attention/ops/triton_mla_sparse_kernel.py     vllm/v1/worker/gpu/model_runner.py     vllm/v1/worker/gpu/pp_utils.py     vllm/v1/worker/gpu/spec_decode/autoregressive/speculator.py     vllm/v1/worker/gpu/spec_decode/speculator.py 2>&1 | grep "undefined name" || true)
+  if [ -n "$OUT" ]; then
+    echo "$OUT"
+    echo "UNDEFINED_NAMES_FOUND - a patch references a symbol nothing defines. Refusing to commit the image."
+    exit 1
+  fi
+  echo "NO_UNDEFINED_NAMES"'
+
 docker commit $NAME "$IMG_OUT"
 docker rm -f $NAME
 echo "BUILT: $IMG_OUT"
