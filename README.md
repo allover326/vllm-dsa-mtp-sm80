@@ -50,6 +50,35 @@ docker run --rm --runtime=nvidia --shm-size=32g \
 
 Benchmark baseline-vs-MTP instead with `glm_mtp_bench.py` (see file header).
 
+## Verifying a build
+
+`build_compose.sh` refuses to commit an image that fails verification, and
+`verify_patches.sh` runs the same checks against an image you already have:
+
+```bash
+./verify_patches.sh                          # or: ./verify_patches.sh my-tag
+```
+
+Three checks, in increasing order of what they catch:
+
+| check | catches |
+|---|---|
+| `py_compile` | syntax only — **passes on code that cannot run** |
+| import smoke | import-time breakage |
+| **undefined names** (pyflakes) | **a patch that CALLS something no patch DEFINES** |
+
+The third one is the one that matters, and it exists because of a real failure in
+the sibling repo. A patch generated against a working tree that already contains a
+helper captures the *call sites* and not the *helper*: the diff applies cleanly on
+the author's machine and raises `NameError` on everyone else's. That shipped in
+[deepseek-v4-cmp170hx#1](https://github.com/allover326/deepseek-v4-cmp170hx/issues/1)
+— patch 0006 called two functions that no patch defined, and two people lost time
+to it before it was found.
+
+**`py_compile` and the import smoke test both pass on that bug**, because the
+missing name is only resolved when the function actually runs — which is why
+neither was sufficient and the third check was added.
+
 ## Validation status (updated 2026-07-30)
 
 - **GLM-5.2-744B real weights (`QuantTrio/GLM-5.2-Int4-Int8Mix`), 8× CMP 170HX
@@ -135,6 +164,7 @@ A source-tree fork with everything applied is also available:
 | `build_compose.sh` | one-shot image build from `vllm/vllm-openai:v0.26.0` |
 | `pr46994-vllm-only.diff`, `pr38476-vllm-only.diff` | the two PRs, filtered to `vllm/` files |
 | `fix_compose_skew.py` | the 15 skew fixes (respects `VLLM_TREE` for source checkouts) |
+| `verify_patches.sh` | compile + import smoke + **undefined-name** check against a built image |
 | `glm_mtp_bench.py` | baseline-vs-MTP decode benchmark + acceptance metrics |
 | `gen_tiny_glm.py`, `tiny_glm_config.json`, `glm_key_manifest.json` | regenerate the tiny random-init `glm_moe_dsa` test checkpoint |
 | `tiny_glm_test.py` | PP1 / PP2 / PP2+MTP greedy-equivalence matrix |
